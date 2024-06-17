@@ -1,9 +1,31 @@
 import requests
 from bs4 import BeautifulSoup
+from lxml import html
 import pandas as pd
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
-from lxml import html
+import logging
+import sys
+import random
+import time
+import urllib3
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+
+# Initialize WebDriver with headless options
+chrome_options = Options()
+chrome_options.add_argument("--headless")
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--disable-dev-shm-usage")
+
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+
+# Disable SSL warnings temporarily (Not recommended for production)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 # List of websites to scrape
 websites = {
@@ -122,6 +144,28 @@ websites = {
     ]
 }
 
+# Set up logging to both console and file
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+
+# Create handlers
+file_handler = logging.FileHandler('scraper.log', encoding='utf-8')
+file_handler.setLevel(logging.DEBUG)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+
+# Create formatters and add them to handlers
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+
+console_formatter = logging.Formatter('%(levelname)s - %(message)s')
+console_handler.setFormatter(console_formatter)
+
+# Add handlers to the logger
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
 # Configure retries
 session = requests.Session()
 retry = Retry(
@@ -133,140 +177,134 @@ adapter = HTTPAdapter(max_retries=retry)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
-from lxml import html
+# List of user agents for rotation
+user_agents = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:54.0) Gecko/20100101 Firefox/54.0",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/56.0.2924.87 Safari/537.36"
+]
 
-def get_product_info(url, name_selector, price_selector, url_selector):
-    response = session.get(url)
+# Initialize WebDriver (assuming ChromeDriver is in your PATH)
+driver = webdriver.Chrome()
+
+def is_javascript_heavy(url):
+    headers = {
+        'User-Agent': random.choice(user_agents),
+    }
+    response = session.get(url, headers=headers, verify=False)
     soup = BeautifulSoup(response.text, 'html.parser')
+    # Heuristic: Check for common AJAX indicators
+    if soup.find_all(['script', 'noscript']):
+        return True
+    return False
+
+def extract_products_with_selenium(url):
+    logger.info(f"Scraping URL with Selenium: {url}")
+    driver.get(url)
+    time.sleep(3)  # Wait for JavaScript to load content
     products = []
 
-    # Debug: Print the URL being scraped
-    print(f"Scraping URL: {url}")
-
-    # Convert BeautifulSoup object to lxml object
-    tree = html.fromstring(response.content)
-
-    # Find all product name elements
-    name_elements = tree.cssselect(name_selector)
-
-    # Debug: Print the count of name elements found
-    print(f"Found {len(name_elements)} name elements")
-
-    for name_element in name_elements:
+    price_elements = driver.find_elements(By.XPATH, "//*[contains(text(), '₪') or contains(text(), 'NIS')]")
+    for price_element in price_elements:
         try:
-            name = name_element.text_content().strip()
-            # Debug: Print the product name
-            print(f"Product Name: {name}")
+            # Get the parent element that contains the product details
+            product_element = price_element.find_element(By.XPATH, "./ancestor::*[contains(@class, 'product') or contains(@class, 'item')]")
+            price = price_element.text.strip()
+            logger.info(f"Product Price: {price}")
 
-            # Traverse to find the price element
-            price_element = name_element.xpath(f'following-sibling::{price_selector}')
-            if not price_element:
-                price_element = name_element.xpath(f'ancestor::{price_selector}')
-            if price_element:
-                price = price_element[0].text_content().strip()
-                # Debug: Print the product price
-                print(f"Product Price: {price}")
-            else:
-                print(f"No price found for product: {name}")
-                continue
+            name = product_element.text.split(price)[0].strip()  # Extract name from the product element
+            logger.info(f"Product Name: {name}")
 
-            # Traverse to find the URL element
-            url_element = name_element.xpath(f'ancestor::{url_selector}')
-            if url_element and 'href' in url_element[0].attrib:
-                product_url = url_element[0].attrib['href']
-                # Debug: Print the product URL
-                print(f"Product URL: {product_url}")
-            else:
-                print(f"No URL found for product: {name}")
-                continue
+            product_url = product_element.find_element(By.XPATH, "./ancestor-or-self::a[contains(@href, 'product') or contains(@href, 'item')]").get_attribute('href')
+            logger.info(f"Product URL: {product_url}")
 
             products.append({'name': name, 'price': price, 'url': product_url})
-        except AttributeError as e:
-            print(f"AttributeError: {e}")
+        except Exception as e:
+            logger.error(f"Error extracting product with Selenium: {e}")
             continue
-
-    # Debug: Print the products found
-    print(f"Products found: {products}")
 
     return products
 
 
+def extract_products_with_requests(url):
+    logger.info(f"Scraping URL with requests: {url}")
+    headers = {
+        'User-Agent': random.choice(user_agents),
+        'Referer': url
+    }
+    try:
+        response = session.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request failed for {url}: {e}")
+        return []
+
+    tree = html.fromstring(response.content)
+    products = []
+
+    price_elements = tree.xpath("//*[contains(text(), '₪') or contains(text(), 'NIS')]")
+    for price_element in price_elements:
+        try:
+            price = price_element.text_content().strip()
+            logger.info(f"Product Price: {price}")
+
+            product_element = price_element.xpath("./ancestor::*[contains(@class, 'product') or contains(@class, 'item')]")[0]
+            name = product_element.text_content().split(price)[0].strip()  # Extract name from the product element
+            logger.info(f"Product Name: {name}")
+
+            product_url_elements = product_element.xpath("./ancestor-or-self::a[contains(@href, 'product') or contains(@href, 'item')]")
+            product_url = product_url_elements[0].get('href') if product_url_elements else 'N/A'
+            logger.info(f"Product URL: {product_url}")
+
+            products.append({'name': name, 'price': price, 'url': product_url})
+        except Exception as e:
+            logger.error(f"Error extracting product with requests: {e}")
+            continue
+
+    return products
+
+
+def get_product_info(url):
+    if is_javascript_heavy(url):
+        return extract_products_with_selenium(url)
+    else:
+        return extract_products_with_requests(url)
 
 
 def main():
+    logger.info("Starting scraping process")
     writer = pd.ExcelWriter('fish_products.xlsx', engine='openpyxl')
     for site_name, urls in websites.items():
-        print(f"Scraping {site_name}...")
+        logger.info(f"Scraping {site_name}...")
         all_products = []
         for url in urls:
-            # Update these selectors based on the actual HTML structure of each website
-            if site_name == "Shuk HaDagim":
-                name_selector = "div.elementor-widget-container h2"  # Adjusted selector for product name
-                price_selector = ".price ins"  # Adjusted selector for price within product container
-                url_selector = "a.elementor-cta"
-            elif site_name == "Udi Fish":
-                name_selector = "div.item-name a"
-                price_selector = "div.price-box.bold-price .price"
-                url_selector = "div.item-name a"
-            elif site_name == "Shaldag":
-                name_selector = "li.product h2"
-                price_selector = "li.product span.price ins"
-                url_selector = "li.product a.woocommerce-loop-product__link"
-            elif site_name == "Zano-Dagim":
-                name_selector = "div.item.col-xs-3 p.product-name a"
-                price_selector = "div.item.col-xs-3 span.price"
-                url_selector = "div.item.col-xs-3 a.product-image"
-            elif site_name == "BatShon":
-                name_selector = "div.veg_price_content h3"
-                price_selector = "div.price_veg p ins"
-                url_selector = "a.getpopup"
-            elif site_name == "Sea2door":
-                name_selector = "div.item-wrap div.woocommerce-loop-product__title"
-                price_selector = "div.item-wrap span.price span.woocommerce-Price-amount"
-                url_selector = "a.woocommerce-LoopProduct-link"
-            elif site_name == "Okyanos":
-                name_selector = "div.astra-shop-summary-wrap h2.woocommerce-loop-product__title"
-                price_selector = "div.astra-shop-summary-wrap span.price span.woocommerce-Price-amount"
-                url_selector = "a.ast-loop-product__link"
-            elif site_name == "Dagi-Kineret":
-                name_selector = "li.product div.woocommerce-loop-product__title"
-                price_selector = "li.product span.price span.woocommerce-Price-amount"
-                url_selector = "a.woocommerce-LoopProduct-link"
-            elif site_name == "Fisherman":
-                name_selector = "div.inbox3 h2.woocommerce-loop-product__title"
-                price_selector = "div.inbox3 span.price span.woocommerce-Price-amount"
-                url_selector = "a.woocommerce-LoopProduct-link"
-            elif site_name == "Butik-Dagim":
-                name_selector = "div.jet-listing-grid__item h2.elementor-heading-title"
-                price_selector = "div.jet-listing-grid__item div.jet-listing-dynamic-field__content ins span.woocommerce-Price-amount"
-                url_selector = "a.elementor-element"
-            elif site_name == "BitmanFish":
-                name_selector = "div.jet-listing-grid__item h2.elementor-heading-title"
-                price_selector = "div.jet-listing-grid__item div.jet-listing-dynamic-field__content ins span.woocommerce-Price-amount"
-                url_selector = "a.jet-listing-dynamic-post"
-            elif site_name == "Rupinfish":
-                name_selector = "li.product h2.woocommerce-loop-product__title"
-                price_selector = "li.product span.price"
-                url_selector = "a.woocommerce-LoopProduct-link"
-            else:
-                name_selector = 'div.product'  # Generic selector as a fallback
-                price_selector = 'span.price'
-                url_selector = 'a.product-link'  # Hypothetical example, adjust as needed
-
             try:
-                products = get_product_info(url, name_selector, price_selector, url_selector)
+                products = get_product_info(url)
                 all_products.extend(products)
+                time.sleep(1)  # Add delay to prevent triggering firewalls
             except requests.exceptions.RequestException as e:
-                print(f"Error scraping {site_name} at {url}: {e}")
+                logger.error(f"Error scraping {site_name} at {url}: {e}")
 
         if all_products:
             df = pd.DataFrame(all_products)
             df.to_excel(writer, sheet_name=site_name, index=False)
         else:
-            print(f"No products found for {site_name}")
+            logger.warning(f"No products found for {site_name}")
+            # Ensure at least one empty sheet is created
+            df = pd.DataFrame([{'name': 'No products', 'price': 'N/A', 'url': 'N/A'}])
+            df.to_excel(writer, sheet_name=site_name, index=False)
     writer.close()
-    print("Scraping complete. Data saved to fish_products.xlsx")
-
+    logger.info("Scraping complete. Data saved to fish_products.xlsx")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.warning("Script interrupted by user")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+    finally:
+        driver.quit()
